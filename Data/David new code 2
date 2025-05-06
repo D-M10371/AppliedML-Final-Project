@@ -1,0 +1,210 @@
+```{r setup, message=FALSE, warning=FALSE}
+#=== 1. Load Packages =========================================================
+required <- c(
+  "tidyverse","skimr","naniar","corrplot",
+  "caret","randomForest","MLmetrics",
+  "tigris","sf","purrr","ggthemes"
+)
+new_pkgs <- setdiff(required, rownames(installed.packages()))
+if(length(new_pkgs)) install.packages(new_pkgs)
+lapply(required, library, character.only=TRUE)
+options(tigris_use_cache = TRUE)
+```
+
+```{r load-data}
+#=== 2. Load Data & Inspect ==================================================
+data_path <- "updated_projectdata.csv"
+df <- read_csv(data_path)
+cat("Rows × Cols:", dim(df), "\n")
+glimpse(df)
+```
+
+```{r missingness}
+#=== 3. Missingness & Quality Checks ==========================================
+print(colSums(is.na(df)))
+gg_miss_var(df) + labs(title="Missing Values by Column")
+```
+
+```{r uni-eda}
+#=== 4. Univariate EDA ========================================================
+skim(df %>% select(median_income, housing_price, permits, population))
+df %>%
+  select(median_income, housing_price, permits, population) %>%
+  pivot_longer(everything(), names_to="var", values_to="val") %>%
+  ggplot(aes(val)) +
+    geom_histogram(bins=40, fill="skyblue", color="white") +
+    facet_wrap(~var, scales="free") +
+    labs(title="Distributions of Key Variables")
+```
+
+```{r corr-matrix}
+#=== 5. Correlation Analysis =================================================
+num_df <- df %>%
+  select(median_income, nonfamily_income, housing_price,
+         permits, population) %>%
+  mutate(pop_change = NA)  # placeholder for visualization
+M <- cor(df %>% select(median_income, nonfamily_income, housing_price,
+                        permits, population), use="pairwise.complete.obs")
+corrplot(M, method="color", addCoef.col="black",
+         tl.cex=0.7, title="Correlation Matrix", mar=c(0,0,1,0))
+```
+
+```{r time-trends-fixed}
+#=== 6. Temporal Trends ======================================================
+df %>%
+  group_by(year) %>%
+  summarize(avg_price = mean(housing_price, na.rm=TRUE)) %>%
+  ggplot(aes(year, avg_price)) +
+    geom_line(color="steelblue", size=1) +
+    geom_point(color="steelblue", size=2) +
+    scale_y_continuous(labels=scales::dollar_format()) +
+    labs(title="Average County Housing Price by Year", x="Year", y="Avg. Price (USD)") +
+    theme_minimal()
+
+df %>%
+  arrange(county, year) %>%
+  group_by(county) %>%
+  mutate(growth = (housing_price - lag(housing_price)) / lag(housing_price)) %>%
+  ungroup() %>%
+  group_by(year) %>%
+  summarize(avg_growth = mean(growth, na.rm=TRUE)) %>%
+  ggplot(aes(year, avg_growth)) +
+    geom_line(color="darkgreen", size=1) +
+    geom_point(color="darkgreen", size=2) +
+    scale_y_continuous(labels=scales::percent_format(accuracy=1)) +
+    labs(title="Average Annual Housing Price Growth by Year", x="Year", y="Avg. Growth Rate") +
+    theme_minimal()
+```
+
+```{r spatial-choropleth}
+#=== 7. Spatial Choropleth ===================================================
+df_map <- df %>%
+  mutate(
+    GEO_chr     = as.character(GEO_ID),
+    state_fips  = substr(GEO_chr, 1, 2),
+    county_fips = substr(GEO_chr, 3, 5),
+    GEOID       = paste0(state_fips, county_fips),
+    growth_rate = (housing_price - lag(housing_price)) / lag(housing_price)
+  ) %>% filter(!is.na(growth_rate))
+counties_sf <- counties(cb=TRUE, year=2020, class="sf") %>% select(GEOID, geometry)
+map_df <- left_join(counties_sf, df_map, by="GEOID")
+ggplot(map_df) +
+  geom_sf(aes(fill=growth_rate), color=NA) +
+  scale_fill_viridis_c(labels=scales::percent_format()) +
+  labs(title="County‐Level Annual Housing Price Growth", fill="Growth Rate") +
+  theme_void()
+```
+
+```{r feat-eng}
+#=== 8. Feature Engineering ==================================================
+df <- df %>%
+  arrange(county, year) %>%
+  group_by(county) %>%
+    mutate(
+      price_lag    = lag(housing_price),
+      growth_rate  = (housing_price - price_lag) / price_lag,
+      pop_lag      = lag(population),
+      pop_change   = (population - pop_lag) / pop_lag,
+      permits_lag  = lag(permits)
+    ) %>%
+  ungroup() %>% filter(!is.na(pop_change), !is.na(permits_lag), !is.na(growth_rate))
+```
+
+```{r features-cv}
+#=== 9. Define Features & CV Control ========================================
+features <- c("pop_change","permits_lag")
+ctrl     <- trainControl(method="cv", number=5)
+```
+
+```{r baseline-lm}
+#=== 10. Baseline Model: Linear Regression ===================================
+# What: Predict growth as a linear function of pop_change and permits_lag
+# How: 5-fold CV via caret::train(method="lm")
+
+set.seed(42)
+lm_baseline <- train(
+  growth_rate ~ pop_change + permits_lag,
+  data      = df,
+  method    = "lm",
+  trControl = ctrl,
+  metric    = "RMSE"
+)
+# Report baseline performance
+cat("Linear Baseline CV RMSE:", round(lm_baseline$results$RMSE,4), "  ")
+cat("CV MAE:", round(lm_baseline$results$MAE,4), "\n")
+
+
+
+```
+
+```{r baseline-ridge}
+#=== 11. Stronger Baseline: Ridge Regression =================================
+# What: Penalized linear model to handle collinearity
+ridge_grid <- expand.grid(alpha=0, lambda=10^seq(-4,1,length=50))
+set.seed(42)
+ridge_baseline <- train(
+  x          = df[features],
+  y          = df$growth_rate,
+  method     = "glmnet",
+  preProcess = c("center","scale"),
+  tuneGrid   = ridge_grid,
+  trControl  = ctrl,
+  metric     = "RMSE"
+)
+cat("Ridge Baseline CV RMSE:", round(min(ridge_baseline$results$RMSE),4), "\n")
+```
+
+```{r rf-cv}
+#=== 12. Random Forest & CV ==================================================
+# What: Flexible nonparametric model capturing nonlinearities/interactions
+features_rf <- c("pop_change","permits_lag")
+set.seed(42)
+rf_growth <- train(
+  x         = df[features_rf],
+  y         = df$growth_rate,
+  method    = "rf",
+  trControl = ctrl,
+  metric    = "RMSE",
+  tuneLength= 3
+)
+cat("Random Forest CV RMSE:", round(min(rf_growth$results$RMSE),4), "\n")
+```
+
+```{r rf-imp}
+#=== 12b. Random Forest Feature Importances ==================================
+imp_rf <- varImp(rf_growth)$importance %>%
+  rownames_to_column("Feature") %>%
+  rename(Importance = Overall) %>%
+  arrange(desc(Importance))
+imp_rf %>% head(5) %>% knitr::kable(digits=3, caption="Top RF Predictors")
+```
+
+```{r model-comparison}
+#=== 13. Model Comparison ===================================================
+# What: Compare LM baseline, Ridge baseline, and Random Forest via CV RMSE
+mod_results <- tibble(
+  Model     = c("Linear Baseline", "Ridge Baseline", "Random Forest"),
+  RMSE_CV   = c(
+    lm_baseline$results$RMSE,
+    min(ridge_baseline$results$RMSE),
+    min(rf_growth$results$RMSE)
+  )
+)
+knitr::kable(mod_results, digits=4, caption="CV RMSE Comparison")
+ggplot(mod_results, aes(x=Model, y=RMSE_CV, fill=Model)) +
+  geom_col() + labs(title="CV RMSE: Linear vs Ridge vs RF", y="RMSE") +
+  theme_minimal()
+```
+
+
+
+
+
+```{r residuals}
+#=== 14. Residual Diagnostics ================================================
+df$pred_rf  <- predict(rf_growth, df[features_rf])
+df$resid_rf <- df$growth_rate - df$pred_rf
+
+ggplot(df, aes(pred_rf, resid_rf)) + geom_point(alpha=0.3) +
+  geom_hline(yintercept=0, lty=2) + labs(title="Residuals vs Fitted (RF)") + theme_minimal()
+```
