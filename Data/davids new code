@@ -1,0 +1,344 @@
+## “Which socioeconomic and housing-market factors most strongly influence year-over-year county-level housing-price growth, and how do those drivers vary across Census regions and over time?” 
+
+```{r}
+
+required <- c(
+  "tidyverse","skimr","naniar","corrplot",
+  "caret","randomForest","MLmetrics",
+  "tigris","sf","purrr","ggthemes"
+)
+
+
+```
+
+```{r}
+
+
+data_path <- "projectdata.csv"
+df        <- read_csv(data_path)
+cat("Rows × Cols:", dim(df), "\n")
+glimpse(df)
+
+```
+
+
+```{r}
+
+
+
+print(colSums(is.na(df)))      
+gg_miss_var(df) +              
+  labs(title="Missing Values by Column")
+
+
+
+```
+
+
+```{r}
+
+skim(df %>% select(
+  median_income, housing_price, permits, Affordability_Index
+))
+
+
+df %>% select(median_income, housing_price, Affordability_Index) %>%
+  pivot_longer(everything(), names_to="var", values_to="val") %>%
+  ggplot(aes(val)) +
+    geom_histogram(bins=40, fill="skyblue", color="white") +
+    facet_wrap(~var, scales="free") +
+    labs(title="Key Variable Distributions")
+
+```
+
+```{R}
+
+#=== 5. Correlation Analysis =================================================
+# What: pairwise correlations; Why: identify strong linear ties & multicollinearity
+num_df <- df %>%
+  select(median_income, nonfamily_income, housing_price,
+         permits, income_25_44, income_45_64,
+         Income_to_Permits, Price_to_Permits,
+         Affordability_Index)
+M <- cor(num_df, use="pairwise.complete.obs")
+corrplot(M, method="color", addCoef.col="black",
+         tl.cex=0.7, title="Correlation Matrix", mar=c(0,0,1,0))
+
+
+
+```
+
+```{r}
+
+#=== 6. Temporal Trends (Fixed) ===============================================
+
+
+df %>%
+  group_by(year) %>%
+  summarize(avg_price = mean(housing_price, na.rm = TRUE)) %>%
+  ggplot(aes(x = year, y = avg_price)) +
+    geom_line(color = "steelblue", size = 1) +
+    geom_point(color = "steelblue", size = 2) +
+    scale_y_continuous(labels = scales::dollar_format()) +
+    labs(
+      title = "Average County Housing Price by Year",
+      x     = "Year",
+      y     = "Avg. Price (USD)"
+    ) +
+    theme_minimal()
+
+
+df %>%
+  arrange(county, year) %>%
+  group_by(county) %>%
+  mutate(growth = (housing_price - lag(housing_price)) / lag(housing_price)) %>%
+  ungroup() %>%
+  group_by(year) %>%
+  summarize(avg_growth = mean(growth, na.rm = TRUE)) %>%
+  ggplot(aes(x = year, y = avg_growth)) +
+    geom_line(color = "darkgreen", size = 1) +
+    geom_point(color = "darkgreen", size = 2) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    labs(
+      title = "Average Annual Housing Price Growth by Year",
+      x     = "Year",
+      y     = "Avg. Growth Rate"
+    ) +
+    theme_minimal()
+
+
+
+```
+
+```{r}
+
+#=== 7. Spatial Choropleth (ADDED) ============================================
+
+df_map <- df %>%
+  mutate(
+    GEO_chr    = as.character(GEO_ID),
+    state_fips = substr(GEO_chr, 1, 2),      
+    county_fips= substr(GEO_chr, 3, 5),     
+    GEOID      = paste0(state_fips, county_fips),
+    growth_rate= (housing_price - lag(housing_price))/lag(housing_price)
+  ) %>% filter(!is.na(growth_rate))
+
+
+counties_sf <- counties(cb=TRUE, year=2020, class="sf") %>%
+  select(GEOID, geometry)
+map_df <- left_join(counties_sf, df_map, by="GEOID")
+
+
+ggplot(map_df) +
+  geom_sf(aes(fill=growth_rate), color=NA) +
+  scale_fill_viridis_c(labels=scales::percent_format()) +
+  labs(
+    title="County‐Level Annual Housing Price Growth",
+    fill="Growth Rate"
+  ) +
+  theme_void()
+
+
+```
+
+```{r}
+
+#=== 8. Feature Engineering ===================================================
+
+df <- df %>%
+  arrange(county, year) %>%
+  group_by(county) %>%
+    mutate(
+      price_lag        = lag(housing_price),
+      growth_rate      = (housing_price - price_lag)/price_lag,
+      median_inc_lag   = lag(median_income),
+      permits_lag      = lag(permits),
+      price_income_ratio = housing_price/median_income,
+      log_price        = log(housing_price),
+      log_income       = log(median_income)
+    ) %>%
+  ungroup() %>%
+  filter(!is.na(growth_rate))
+
+
+
+```
+
+
+```{r}
+
+
+
+#=== 9. Baseline RMSE =========================================================
+
+y        <- df$growth_rate
+baseline <- rep(mean(y), length(y))
+cat("Baseline RMSE:", round(RMSE(baseline, y),4), "\n")
+
+
+```
+
+```{r}
+
+
+#=== 10. Random Forest & CV ===================================================
+
+features <- c(
+  "median_inc_lag","nonfamily_income","permits_lag",
+  "income_25_44","income_45_64",
+  "Income_to_Permits","Price_to_Permits",
+  "price_income_ratio","log_price","log_income"
+)
+set.seed(42)
+ctrl     <- trainControl(method="cv", number=5)
+rf_growth<- train(
+  x = df[features], y = y,
+  method="rf", trControl=ctrl, metric="RMSE", tuneLength=3
+)
+rf_growth$resample %>%
+  mutate(Fold=row_number()) %>%
+  select(Fold, RMSE) %>%
+  knitr::kable(digits=6, caption="RF CV RMSE for Growth")
+
+
+```
+
+
+```{R}
+
+
+
+#=== 11. Feature Importances =================================================
+
+imp_g <- varImp(rf_growth)$importance %>%
+  rownames_to_column("Feature") %>%
+  rename(Importance=Overall) %>%
+  arrange(desc(Importance))
+imp_g %>% head(10)  # top 10
+ggplot(imp_g[1:5,], aes(reorder(Feature, Importance), Importance)) +
+  geom_col(fill="darkgreen") + coord_flip() +
+  labs(title="Top 5 Growth Predictors", y="Importance")
+
+
+
+```
+
+
+
+```{r}
+
+
+
+years <- sort(unique(df$year))
+imp_time <- map_df(years, function(yr){
+  sub <- filter(df, year==yr)
+  rf  <- randomForest(x=sub[features], y=sub$growth_rate)
+  imp <- importance(rf)[,1]
+  tibble(Year=yr, Feature=names(imp), Importance=imp)
+})
+
+# pick top 5 overall
+top_feats <- imp_time %>%
+  group_by(Feature) %>%
+  summarize(mean_imp=mean(Importance)) %>%
+  slice_max(mean_imp, n=5) %>%
+  pull(Feature)
+
+imp_time %>%
+  filter(Feature %in% top_feats) %>%
+  ggplot(aes(x=Year,y=Importance,color=Feature)) +
+    geom_line(size=1) + geom_point() +
+    labs(title="Top 5 Predictors: Importance Over Time")
+
+
+```
+
+
+```{r}
+
+
+#=== 12. Residual Diagnostics ================================================
+
+df$pred <- predict(rf_growth, df[features])
+df$resid<- df$growth_rate - df$pred
+
+ggplot(df, aes(pred, resid)) +
+  geom_point(alpha=0.3) + geom_hline(yintercept=0, lty=2) +
+  labs("Residuals vs Fitted")
+
+ggplot(df, aes(sample=resid)) +
+  stat_qq() + stat_qq_line() +
+  labs("QQ‐Plot of Residuals")
+
+
+```
+
+
+```{r}
+
+
+#=== 13. Robustness Checks ===================================================
+
+thr     <- quantile(df$growth_rate, 0.99)
+df_sub  <- filter(df, growth_rate < thr)
+rf_sub  <- train(x=df_sub[features], y=df_sub$growth_rate,
+                 method="rf", trControl=ctrl, metric="RMSE",
+                 tuneGrid=rf_growth$bestTune)
+cat("RF w/o top1% RMSE:\n")
+print(rf_sub$resample %>% select(RMSE))
+
+
+train_df<- filter(df, year<=2018)
+test_df <- filter(df, year>2018)
+rf_time <- randomForest(x=train_df[features], y=train_df$growth_rate)
+pred_to <- predict(rf_time, test_df[features])
+cat("Temporal hold-out RMSE:", RMSE(pred_to, test_df$growth_rate), "\n")
+
+
+```
+
+```{r}
+
+
+
+
+region_counts <- df_regions %>%
+  filter(region %in% valid_regions) %>%
+  count(region, name = "n")
+print(region_counts)
+
+
+min_n <- min(region_counts$n)
+cat("Sampling", min_n, "rows per region for balance.\n")
+
+
+set.seed(42)
+imp_reg_balanced <- map_df(valid_regions, function(rgn) {
+  sub       <- filter(df_regions, region == rgn)
+  sub_samp  <- sample_n(sub, min_n)            # random sample
+  rf        <- randomForest(x = sub_samp[features], y = sub_samp$growth_rate)
+  im        <- randomForest::importance(rf)[,1]
+  tibble(
+    Region     = rgn,
+    Feature    = names(im),
+    Importance = im
+  )
+})
+
+
+imp_reg_balanced %>%
+  filter(Feature %in% top_feats) %>%
+  ggplot(aes(x = Region, y = Importance, fill = Region)) +
+    geom_col(position = "dodge") +
+    facet_wrap(~ Feature, scales = "free_y") +
+    labs(
+      title = "Top Predictors of Price Growth by Region (Balanced Samples)",
+      y     = "Importance (IncMSE)"
+    ) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+
+
+```
